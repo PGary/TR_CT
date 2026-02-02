@@ -1,0 +1,10 @@
+name: TR_CT
+channels:
+  - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/
+dependencies:
+  - python=3.11.*
+  - snowflake-snowpark-python
+  - streamlit
+  - numpy
+  - opencv=4.10.0
+  - matplotlib=3.9.2
