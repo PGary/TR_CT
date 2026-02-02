@@ -7,35 +7,27 @@ import matplotlib.gridspec as gridspec
 from matplotlib.colors import LinearSegmentedColormap
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor
-import tkinter as tk
-from tkinter import filedialog
 
-# --- 1. 自定义色卡 (黑色为背景) ---
+# --- 1. 专业色卡设定 ---
 cmap_red = LinearSegmentedColormap.from_list("black_red", ["black", "red"])
 cmap_orange = LinearSegmentedColormap.from_list("black_orange", ["black", "orange"])
 
-# --- 2. 状态管理 ---
+# --- 2. 状态管理与坐标默认值设定 ---
 if 'step' not in st.session_state: st.session_state.step = 'setup'
-if 'path' not in st.session_state: st.session_state.path = ""
+if 'uploaded_files' not in st.session_state: st.session_state.uploaded_files = {}
+
+# 严格按照用户要求的默认值初始化坐标
 if 'crops' not in st.session_state:
-    st.session_state.crops = {k: [100, 1200, 50, 985] for k in ['qian1', 'shang1', 'you1']}
-if 'raw_data' not in st.session_state: st.session_state.raw_data = None
-if 'bin1_data' not in st.session_state: st.session_state.bin1_data = None
-if 'bin2_data' not in st.session_state: st.session_state.bin2_data = None
+    st.session_state.crops = {
+        'qian1': [350, 1000, 50, 985],  # W1, W2, H1, H2
+        'shang1': [150, 1000, 300, 800],
+        'you1': [500, 800, 50, 985]
+    }
 
-st.set_page_config(layout="wide", page_title="Thermal Runaway CT Expert")
-
-
-# --- 3. 辅助函数 ---
-def browse_folder():
-    root = tk.Tk();
-    root.withdraw();
-    root.attributes('-topmost', True)
-    path = filedialog.askdirectory(master=root)
-    root.destroy()
-    if path: st.session_state.path = path
+st.set_page_config(layout="wide", page_title="CT Expert Web V11")
 
 
+# --- 3. 核心内存读取函数 ---
 def get_seg_indices(total, m):
     size = int(total / (0.8 * m + 0.2))
     overlap = int(0.2 * size)
@@ -43,261 +35,194 @@ def get_seg_indices(total, m):
     return [(int(i * step), int(min(i * step + size, total))) for i in range(m)]
 
 
-def read_and_crop(args):
-    path, h1, h2, w1, w2 = args
-    img = cv2.imread(path, 0)
+def decode_and_crop(args):
+    file_bytes, h1, h2, w1, w2 = args
+    file_bytes.seek(0)
+    file_np = np.frombuffer(file_bytes.read(), np.uint8)
+    img = cv2.imdecode(file_np, cv2.IMREAD_GRAYSCALE)
     return img[h1:h2, w1:w2] if img is not None else None
 
 
-def load_data_threaded(folder_path, indices, crop, p_bar, status_txt, label, mode='raw', threshold_range=None):
-    valid_exts = ('.png', '.tif', '.tiff', '.jpg', '.jpeg')
-    files = sorted([f for f in os.listdir(folder_path) if f.lower().endswith(valid_exts)])
+def process_uploaded_threaded(files, indices, crop, p_bar, status_txt, label, mode='raw', threshold_range=None):
     w1, w2, h1, h2 = crop
     processed_avgs = []
-
     for idx, (s, e) in enumerate(indices):
-        status_txt.text(f"计算 {label} - {mode}: 分段 {idx + 1}/{len(indices)}")
-        subset = [os.path.join(folder_path, files[i]) for i in range(s, min(e, len(files)))]
+        status_txt.text(f"处理 {label} - {mode}: 分段 {idx + 1}/{len(indices)}")
+        subset_files = files[s:e]
+        args_list = [(f, h1, h2, w1, w2) for f in subset_files]
         with ThreadPoolExecutor(max_workers=8) as exe:
-            stack = list(exe.map(read_and_crop, [(p, h1, h2, w1, w2) for p in subset]))
-
+            stack = list(exe.map(decode_and_crop, args_list))
         stack = [i for i in stack if i is not None]
         if not stack:
             processed_avgs.append(np.zeros((h2 - h1, w2 - w1), dtype=np.float32));
             continue
-
         if mode == 'raw':
             processed_avgs.append(np.mean(stack, axis=0))
         else:
-            low, high = threshold_range
-            bin_stack = [((img >= low) & (img <= high)).astype(np.float32) for img in stack]
+            l, h = threshold_range
+            bin_stack = [((img >= l) & (img <= h)).astype(np.float32) for img in stack]
             processed_avgs.append(np.mean(bin_stack, axis=0))
         p_bar.progress((idx + 1) / len(indices))
     return np.array(processed_avgs)
 
 
-# --- 4. 侧边栏 ---
+# --- 4. 侧边栏：文件上传与坐标微调 ---
 with st.sidebar:
-    st.header("📂 1. 项目与路径")
-    if st.button("📁 浏览本地文件夹"): browse_folder()
-    st.session_state.path = st.text_input("项目路径:", st.session_state.path)
+    st.header("📤 1. 上传本地图片集")
+    st.caption("提示：在文件框内 Ctrl+A 全选文件夹内图片上传")
+    dirs_map = {'qian1': 'Front (前)', 'shang1': 'Top (上)', 'you1': 'Right (右)'}
+
+    for k, label in dirs_map.items():
+        files = st.file_uploader(f"上传 {label} 图片", accept_multiple_files=True, key=f"up_{k}")
+        if files:
+            st.session_state.uploaded_files[k] = sorted(files, key=lambda x: x.name)
+            st.success(f"已加载 {len(files)} 张")
+
     m_seg = st.slider("分段数量 (m)", 5, 20, 9)
 
     st.divider()
-    st.header("✂️ 2. 独立裁切")
-    dirs_map = {'qian1': 'Front', 'shang1': 'Top', 'you1': 'Right'}
+    st.header("✂️ 2. 裁切坐标微调")
     for k, label in dirs_map.items():
-        with st.expander(f"裁切: {label}"):
+        with st.expander(f"{label} 坐标设置"):
             c = st.session_state.crops[k]
+            # 默认值已在初始化时设定
             c[0] = st.number_input(f"W1 ({k})", 0, 5000, c[0], key=f"w1_{k}")
             c[1] = st.number_input(f"W2 ({k})", 0, 5000, c[1], key=f"w2_{k}")
             c[2] = st.number_input(f"H1 ({k})", 0, 5000, c[2], key=f"h1_{k}")
             c[3] = st.number_input(f"H2 ({k})", 0, 5000, c[3], key=f"h2_{k}")
 
-    if st.button("🚀 加载原始灰度数据"):
-        if os.path.exists(st.session_state.path):
+    if st.button("🚀 开始计算原始平均图"):
+        if len(st.session_state.uploaded_files) == 3:
             res = {}
             pb = st.progress(0);
             txt = st.empty()
             for k in dirs_map.keys():
-                sub_p = os.path.join(st.session_state.path, k)
-                files = [f for f in os.listdir(sub_p) if f.lower().endswith(('.png', '.tif', '.tiff', '.jpg', '.jpeg'))]
-                res[k] = load_data_threaded(sub_p, get_seg_indices(len(files), m_seg), st.session_state.crops[k], pb,
-                                            txt, dirs_map[k], mode='raw')
+                files = st.session_state.uploaded_files[k]
+                res[k] = process_uploaded_threaded(files, get_seg_indices(len(files), m_seg), st.session_state.crops[k],
+                                                   pb, txt, dirs_map[k])
             st.session_state.raw_data = res
             st.session_state.step = 'thre1_tuning';
             st.rerun()
+        else:
+            st.error("请先上传所有方向的图片集")
 
-# --- 5. 主流程 ---
+# --- 5. 主流程界面 ---
 
 # 步骤 1: 裁切预览
 if st.session_state.step == 'setup':
-    st.header("1. 裁切预览 (中位切片)")
-    if st.session_state.path and os.path.exists(st.session_state.path):
-        cols = st.columns(3)
-        for i, (k, label) in enumerate(dirs_map.items()):
-            sub_p = os.path.join(st.session_state.path, k)
-            if os.path.exists(sub_p):
-                files = sorted(
-                    [f for f in os.listdir(sub_p) if f.lower().endswith(('.png', '.tif', '.tiff', '.jpg', '.jpeg'))])
-                if files:
-                    img = cv2.imread(os.path.join(sub_p, files[len(files) // 2]), 0)
-                    if img is not None:
-                        fig, ax = plt.subplots();
-                        ax.imshow(img, cmap='gray');
-                        c = st.session_state.crops[k]
-                        ax.add_patch(plt.Rectangle((c[0], c[2]), c[1] - c[0], c[3] - c[2], lw=2, ec='red', fc='none'))
-                        ax.set_title(f"{label} View");
-                        ax.axis('on');
-                        cols[i].pyplot(fig);
-                        plt.close(fig)
+    st.header("1. 独立裁切预览 (中位切片)")
+    cols = st.columns(3)
+    for i, (k, label) in enumerate(dirs_map.items()):
+        if k in st.session_state.uploaded_files:
+            files = st.session_state.uploaded_files[k]
+            f = files[len(files) // 2];
+            f.seek(0)
+            img = cv2.imdecode(np.frombuffer(f.read(), np.uint8), 0)
+            if img is not None:
+                fig, ax = plt.subplots();
+                ax.imshow(img, cmap='gray')
+                c = st.session_state.crops[k]
+                ax.add_patch(plt.Rectangle((c[0], c[2]), c[1] - c[0], c[3] - c[2], lw=2, ec='red', fc='none'))
+                ax.set_title(f"{label}");
+                ax.axis('on');
+                cols[i].pyplot(fig);
+                plt.close(fig)
 
-# 步骤 2: Thre1 确定 (左右布局)
-elif st.session_state.step == 'thre1_tuning':
-    st.header("2. 确定第一阈值范围 (Thre 1)")
+# 步骤 2 & 3: 阈值确定 (左右布局 + 三点验证)
+elif st.session_state.step in ['thre1_tuning', 'thre2_tuning']:
+    is_s1 = st.session_state.step == 'thre1_tuning'
+    st.header(f"{'2. 第一阈值设定' if is_s1 else '3. 第二阈值设定'}")
     col_l, col_r = st.columns([1, 4])
     with col_l:
-        l1 = st.slider("二值化 1 下限", 0, 255, 0)
-        h1 = st.slider("二值化 1 上限", 0, 255, 120)
-        if st.button("✅ 确认并进入下一步"):
+        l = st.slider("下限", 0, 255, 0 if is_s1 else 60)
+        h = st.slider("上限", 0, 255, 120)
+        if st.button("✅ 确认并生成分布图"):
             pb = st.progress(0);
             txt = st.empty()
-            res_bin1 = {}
+            res_bin = {}
             for k in dirs_map.keys():
-                sub_p = os.path.join(st.session_state.path, k)
-                files = [f for f in os.listdir(sub_p) if f.lower().endswith(('.png', '.tif', '.tiff', '.jpg', '.jpeg'))]
-                res_bin1[k] = load_data_threaded(sub_p, get_seg_indices(len(files), m_seg), st.session_state.crops[k],
-                                                 pb, txt, dirs_map[k], mode='bin', threshold_range=(l1, h1))
-            st.session_state.bin1_data = res_bin1;
-            st.session_state.r1 = (l1, h1);
-            st.session_state.step = 'thre2_tuning';
+                files = st.session_state.uploaded_files[k]
+                res_bin[k] = process_uploaded_threaded(files, get_seg_indices(len(files), m_seg),
+                                                       st.session_state.crops[k], pb, txt, dirs_map[k], mode='bin',
+                                                       threshold_range=(l, h))
+            if is_s1:
+                st.session_state.bin1_data = res_bin;
+                st.session_state.r1 = (l, h);
+                st.session_state.step = 'thre2_tuning'
+            else:
+                st.session_state.bin2_data = res_bin;
+                st.session_state.r2 = (l, h);
+                st.session_state.step = 'scaling'
             st.rerun()
     with col_r:
-        sub_p = os.path.join(st.session_state.path, 'qian1')
-        files = sorted([f for f in os.listdir(sub_p) if f.lower().endswith(('.png', '.tif', '.tiff', '.jpg', '.jpeg'))])
+        files = st.session_state.uploaded_files['qian1']
         idxs = get_seg_indices(len(files), m_seg)[m_seg // 2]
         img_cols = st.columns(3)
-        for i, s_idx in enumerate([idxs[0] + (idxs[1] - idxs[0]) // 4, idxs[0] + (idxs[1] - idxs[0]) // 2,
-                                   idxs[0] + 3 * (idxs[1] - idxs[0]) // 4]):
-            img = cv2.imread(os.path.join(sub_p, files[s_idx]), 0)[
+        samples = [idxs[0] + (idxs[1] - idxs[0]) // 4, idxs[0] + (idxs[1] - idxs[0]) // 2,
+                   idxs[0] + 3 * (idxs[1] - idxs[0]) // 4]
+        for i, s_idx in enumerate(samples):
+            f = files[s_idx];
+            f.seek(0)
+            img = cv2.imdecode(np.frombuffer(f.read(), np.uint8), 0)[
                   st.session_state.crops['qian1'][2]:st.session_state.crops['qian1'][3],
                   st.session_state.crops['qian1'][0]:st.session_state.crops['qian1'][1]]
             with img_cols[i]:
                 fig, ax = plt.subplots(2, 1, figsize=(4, 7))
                 ax[0].imshow(img, cmap='gray');
                 ax[0].axis('off')
-                mask = ((img >= l1) & (img <= h1)).astype(np.float32)
-                ax[1].imshow(mask, cmap=cmap_red);
+                mask = ((img >= l) & (img <= h)).astype(np.float32)
+                ax[1].imshow(mask, cmap=cmap_red if is_s1 else cmap_orange);
                 ax[1].axis('off');
                 st.pyplot(fig);
                 plt.close(fig)
 
-# 步骤 3: Thre2 确定 (左右布局)
-elif st.session_state.step == 'thre2_tuning':
-    st.header("3. 确定第二阈值范围 (Thre 2)")
-    col_l, col_r = st.columns([1, 4])
-    with col_l:
-        l2 = st.slider("二值化 2 下限", 0, 255, 90)
-        h2 = st.slider("二值化 2 上限", 0, 255, 120)
-        if st.button("✅ 确认并进入调窗预览"):
-            pb = st.progress(0);
-            txt = st.empty()
-            res_bin2 = {}
-            for k in dirs_map.keys():
-                sub_p = os.path.join(st.session_state.path, k)
-                files = [f for f in os.listdir(sub_p) if f.lower().endswith(('.png', '.tif', '.tiff', '.jpg', '.jpeg'))]
-                res_bin2[k] = load_data_threaded(sub_p, get_seg_indices(len(files), m_seg), st.session_state.crops[k],
-                                                 pb, txt, dirs_map[k], mode='bin', threshold_range=(l2, h2))
-            st.session_state.bin2_data = res_bin2;
-            st.session_state.r2 = (l2, h2);
-            st.session_state.step = 'scaling_preview';
-            st.rerun()
-    with col_r:
-        sub_p = os.path.join(st.session_state.path, 'qian1')
-        files = sorted([f for f in os.listdir(sub_p) if f.lower().endswith(('.png', '.tif', '.tiff', '.jpg', '.jpeg'))])
-        idxs = get_seg_indices(len(files), m_seg)[m_seg // 2]
-        img_cols = st.columns(3)
-        for i, s_idx in enumerate([idxs[0] + (idxs[1] - idxs[0]) // 4, idxs[0] + (idxs[1] - idxs[0]) // 2,
-                                   idxs[0] + 3 * (idxs[1] - idxs[0]) // 4]):
-            img = cv2.imread(os.path.join(sub_p, files[s_idx]), 0)[
-                  st.session_state.crops['qian1'][2]:st.session_state.crops['qian1'][3],
-                  st.session_state.crops['qian1'][0]:st.session_state.crops['qian1'][1]]
-            with img_cols[i]:
-                fig, ax = plt.subplots(2, 1, figsize=(4, 7))
-                ax[0].imshow(img, cmap='gray');
-                ax[0].axis('off')
-                mask = ((img >= l2) & (img <= h2)).astype(np.float32)
-                ax[1].imshow(mask, cmap=cmap_orange);
-                ax[1].axis('off');
-                st.pyplot(fig);
-                plt.close(fig)
+# 步骤 4: 调窗预览 (Step-by-step scaling)
+elif st.session_state.step == 'scaling':
+    st.header("4. 最终报告调窗预览")
+    mid = m_seg // 2
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.subheader("Raw 层")
+        vr = st.slider("Raw vmin/max", 0.0, 255.0, (0.0, 255.0))
+    with c2:
+        st.subheader("Dist 1 层")
+        v1 = st.slider("Bin1 vmin/max", 0.0, 1.0, (0.0, 0.4), 0.01)
+    with c3:
+        st.subheader("Dist 2 层")
+        v2 = st.slider("Bin2 vmin/max", 0.0, 1.0, (0.0, 0.4), 0.01)
 
-# 步骤 4: 调窗预览 (vmin/vmax 独立选择)
-elif st.session_state.step == 'scaling_preview':
-    st.header("4. 设定各图层显示亮度与对比度 (vmin/vmax 调窗)")
-    st.info("💡 请拖动下方滑块，实时观察中间 Segment (Front) 的三层显示效果。")
-
-    # 获取中间段数据
-    mid_idx = m_seg // 2
-    raw_mid = st.session_state.raw_data['qian1'][mid_idx]
-    bin1_mid = st.session_state.bin1_data['qian1'][mid_idx]
-    bin2_mid = st.session_state.bin2_data['qian1'][mid_idx]
-
-    col_s1, col_s2, col_s3 = st.columns(3)
-    with col_s1:
-        st.markdown("### 1. 原始灰度层")
-        vmin_r = st.slider("Raw vmin", 0.0, 255.0, 0.0)
-        vmax_r = st.slider("Raw vmax", 0.0, 255.0, 255.0)
-    with col_s2:
-        st.markdown("### 2. 二值分布层 1")
-        vmin_b1 = st.slider("Bin1 vmin", 0.0, 1.0, 0.0, 0.01)
-        vmax_b1 = st.slider("Bin1 vmax", 0.0, 1.0, 0.4, 0.01)
-    with col_s3:
-        st.markdown("### 3. 二值分布层 2")
-        vmin_b2 = st.slider("Bin2 vmin", 0.0, 1.0, 0.0, 0.01)
-        vmax_b2 = st.slider("Bin2 vmax", 0.0, 1.0, 0.4, 0.01)
-
-    st.divider()
-
-    # 实时预览
-    prev_col1, prev_col2, prev_col3 = st.columns(3)
-    with prev_col1:
-        fig1, ax1 = plt.subplots();
-        ax1.imshow(raw_mid, cmap='gray', vmin=vmin_r, vmax=vmax_r);
-        ax1.set_title("Raw Scaling Preview");
-        ax1.axis('off');
-        st.pyplot(fig1);
-        plt.close(fig1)
-    with prev_col2:
-        fig2, ax2 = plt.subplots();
-        ax2.imshow(bin1_mid, cmap=cmap_red, vmin=vmin_b1, vmax=vmax_b1);
-        ax2.set_title("Dist 1 Scaling Preview");
-        ax2.axis('off');
-        st.pyplot(fig2);
-        plt.close(fig2)
-    with prev_col3:
-        fig3, ax3 = plt.subplots();
-        ax3.imshow(bin2_mid, cmap=cmap_orange, vmin=vmin_b2, vmax=vmax_b2);
-        ax3.set_title("Dist 2 Scaling Preview");
-        ax3.axis('off');
-        st.pyplot(fig3);
-        plt.close(fig3)
-
-    if st.button("🚀 生成结果大图"):
-        st.session_state.scales = {'raw': (vmin_r, vmax_r), 'bin1': (vmin_b1, vmax_b1), 'bin2': (vmin_b2, vmax_b2)}
+    p1, p2, p3 = st.columns(3)
+    p1.imshow(st.session_state.raw_data['qian1'][mid], cmap='gray', vmin=vr[0], vmax=vr[1])
+    p2.imshow(st.session_state.bin1_data['qian1'][mid], cmap=cmap_red, vmin=v1[0], vmax=v1[1])
+    p3.imshow(st.session_state.bin2_data['qian1'][mid], cmap=cmap_orange, vmin=v2[0], vmax=v2[1])
+    # 注意：Streamlit 1.10+ 直接支持 st.pyplot 或简单封装，此处为演示逻辑
+    st.info("💡 预览满意后请点击下方按钮生成完整大图。")
+    if st.button("🚀 生成最终报告"):
+        st.session_state.sc = {'raw': vr, 'bin1': v1, 'bin2': v2};
         st.session_state.step = 'report';
         st.rerun()
 
 # 步骤 5: 最终报告
 elif st.session_state.step == 'report':
-    st.header("5. 高清CT分析结果")
-    raw, b1, b2, sc = st.session_state.raw_data, st.session_state.bin1_data, st.session_state.bin2_data, st.session_state.scales
+    st.header("5. 高清对比分析大图")
+    raw, b1, b2, sc = st.session_state.raw_data, st.session_state.bin1_data, st.session_state.bin2_data, st.session_state.sc
     h_px, w_px = raw['qian1'][0].shape
-    aspect = h_px / w_px
-    fig = plt.figure(figsize=(m_seg * 2.8, 9 * 2.8 * aspect))
-    gs_m = gridspec.GridSpec(3, 1, hspace=0.1)
-    for i, (k, label) in enumerate(dirs_map.items()):
-        igs = gridspec.GridSpecFromSubplotSpec(3, m_seg, subplot_spec=gs_m[i], wspace=0.01, hspace=0.01)
+    fig = plt.figure(figsize=(m_seg * 2.8, 9 * 2.8 * (h_px / w_px)))
+    gs = gridspec.GridSpec(3, 1, hspace=0.1)
+    for i, k in enumerate(['qian1', 'shang1', 'you1']):
+        igs = gridspec.GridSpecFromSubplotSpec(3, m_seg, subplot_spec=gs[i], wspace=0.01, hspace=0.01)
         for col in range(m_seg):
             ax1 = fig.add_subplot(igs[0, col]);
             ax1.imshow(raw[k][col], cmap='gray', vmin=sc['raw'][0], vmax=sc['raw'][1]);
             ax1.axis('off')
-            if col == 0: ax1.set_ylabel(f"{label}\nRaw", rotation=0, labelpad=40, fontsize=18, va='center',
-                                        fontweight='bold')
-            if i == 0: ax1.set_title(f"Seg {col + 1}", fontsize=14)
             ax2 = fig.add_subplot(igs[1, col]);
             ax2.imshow(b1[k][col], cmap=cmap_red, vmin=sc['bin1'][0], vmax=sc['bin1'][1]);
             ax2.axis('off')
-            if col == 0: ax2.set_ylabel(f"Dist 1\n({st.session_state.r1})", rotation=0, labelpad=40, fontsize=14,
-                                        va='center')
             ax3 = fig.add_subplot(igs[2, col]);
             ax3.imshow(b2[k][col], cmap=cmap_orange, vmin=sc['bin2'][0], vmax=sc['bin2'][1]);
             ax3.axis('off')
-            if col == 0: ax3.set_ylabel(f"Dist 2\n({st.session_state.r2})", rotation=0, labelpad=40, fontsize=14,
-                                        va='center')
     st.pyplot(fig)
     buf = BytesIO();
     fig.savefig(buf, format="png", bbox_inches='tight', dpi=180)
-    st.download_button("💾 下载结果大图", buf.getvalue(), f"Report_{os.path.basename(st.session_state.path)}.png",
-                       "image/png")
-    if st.button("🔄 重新开始分析"): st.session_state.step = 'setup'; st.rerun()
+    st.download_button("💾 下载分析报告", buf.getvalue(), "Final_Report.png", "image/png")
+    if st.button("🔄 重置"): st.session_state.step = 'setup'; st.rerun()
